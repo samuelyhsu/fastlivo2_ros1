@@ -1,0 +1,3 @@
+<launch>
+  <node pkg="mvs_ros_pkg" type="grabImgWithTrigger" name="mvs_camera_trigger" args="$(find mvs_ros_pkg)/config/left_camera_trigger.yaml" respawn="false" output="screen" />
+</launch>
