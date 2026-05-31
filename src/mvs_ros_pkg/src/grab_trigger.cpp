@@ -10,6 +10,7 @@
 #include <ros/ros.h>
 #include <signal.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/ipc.h>
 #include <sys/mman.h>
 #include <sys/stat.h>
@@ -224,6 +225,8 @@ static void *WorkThread(void *pUser) {
     return nullptr;
   }
 
+  int error_count = 0;
+
   while (!exit_flag && ros::ok()) {
 
     nRet = MV_CC_GetOneFrameTimeout(pUser, pData, stParam.nCurValue,
@@ -283,10 +286,31 @@ static void *WorkThread(void *pUser) {
       camera_info_msg.header.stamp = rcv_time;
 
       image_pub.publish(*msg, camera_info_msg);
-      std::string debug_info;
-      debug_info = " Time -> image_msg_current:  " +
-                   std::to_string(msg->header.stamp.toSec());
-      ROS_ERROR(debug_info.c_str());
+      if (error_count > 0) {
+        ROS_ERROR("publish image: error_count=%d, time=%f", error_count,
+                  msg->header.stamp.toSec());
+      } else {
+        ROS_INFO("publish image: time=%f", msg->header.stamp.toSec());
+      }
+    } else {
+      ++error_count;
+      ROS_WARN("MV_CC_GetOneFrameTimeout failed, try "
+               "restart grabbing: error_count=%d, nRet=0x%X",
+               error_count, nRet);
+      int stop_ret = MV_CC_StopGrabbing(pUser);
+      if (stop_ret != MV_OK) {
+        ROS_ERROR("MV_CC_StopGrabbing during recovery failed: ret=0x%X",
+                  stop_ret);
+      }
+
+      int start_ret = MV_CC_StartGrabbing(pUser);
+      if (start_ret == MV_OK) {
+        ROS_WARN("Recovery succeeded: grabbing restarted.");
+      } else {
+        ROS_ERROR("MV_CC_StartGrabbing during recovery failed: ret=0x%X",
+                  start_ret);
+        ros::Duration(0.2).sleep();
+      }
     }
   }
 
