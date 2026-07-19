@@ -3,8 +3,8 @@
 #  实时数据采集 一键启动脚本
 #  启动: rosbridge + LiDAR + 相机 + rosbag 录制，随后启动 FAST-LIVO2 建图
 #  用法（已软链到 ~/.local/bin/collect，任意目录可直接调用）:
-#     collect                  # rosbridge + 采集录包 + 建图
-#     collect --no-record      # 只起传感器，不录包
+#     collect                  # rosbridge + 采集 + 建图（默认不录包）
+#     collect --record         # 额外录制 rosbag
 #     collect --no-mapping     # 只采集，不跑建图
 #     collect --no-rosbridge   # 不起 rosbridge websocket
 #     BAG_DIR=/data/bags collect
@@ -19,7 +19,7 @@ WS="$(cd "$(dirname "$SELF")/.." && pwd)"
 
 # ROS 环境
 ROS_SETUP="/opt/ros/noetic/setup.bash"
-RECORD="true"
+RECORD="false"
 MAPPING="true"
 ROSBRIDGE="true"
 BAG_DIR="${BAG_DIR:-$WS/dataset/rec}"
@@ -28,7 +28,7 @@ MAPPING_DELAY="${MAPPING_DELAY:-5}"
 
 for arg in "$@"; do
   case "$arg" in
-    --no-record)    RECORD="false" ;;
+    --record)       RECORD="true" ;;
     --no-mapping)   MAPPING="false" ;;
     --no-rosbridge) ROSBRIDGE="false" ;;
     -h|--help)   sed -n '2,${/^#/!q; s/^# \{0,1\}//p;}' "$0"; exit 0 ;;
