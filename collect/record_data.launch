@@ -1,0 +1,31 @@
+<launch>
+  <!-- ============================================================
+       实时数据采集：LiDAR + 相机 + rosbag 录制 一体化
+       用法:
+         roslaunch collect/record_data.launch
+         roslaunch collect/record_data.launch record:=false      # 只起传感器，不录包
+         roslaunch collect/record_data.launch bag_dir:=/data/bags # 指定保存目录
+       ============================================================ -->
+
+  <!-- 录制包保存目录 -->
+  <arg name="bag_dir" default="$(env HOME)/dev/fastlivo2_ros1/dataset/rec"/>
+  <!-- 包文件名前缀，rosbag 会自动追加时间戳 -->
+  <arg name="bag_prefix" default="livo"/>
+  <!-- 是否录制（false 时只起传感器，可先确认数据正常）-->
+  <arg name="record" default="true"/>
+
+  <!-- 1) 激光雷达 -->
+  <include file="$(find livox_ros_driver2)/launch_ROS1/msg_MID360s.launch"/>
+
+  <!-- 2) 工业相机（外触发采图）-->
+  <include file="$(find mvs_ros_pkg)/launch/mvs_camera_trigger.launch"/>
+
+  <!-- 3) rosbag 录制指定话题（只录传感器数据，避免 rosout 等冗余）-->
+  <group if="$(arg record)">
+    <node pkg="rosbag" type="record" name="data_recorder" output="screen" args="-o $(arg bag_dir)/$(arg bag_prefix)
+                /livox/lidar
+                /livox/imu
+                /left_camera/image/compressed"/>
+  </group>
+
+</launch>
