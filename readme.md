@@ -38,7 +38,7 @@ roslaunch mvs_ros_pkg mvs_camera_trigger.launch
 ```bash
 # 运行算法
 source devel/setup.bash
-roslaunch fast_livo mapping_mid360.launch 
+roslaunch fast_livo mapping_mid360.launch
 ```
 
 ```bash
@@ -46,7 +46,10 @@ roslaunch fast_livo mapping_mid360.launch
 source devel/setup.bash
 rosbag record -O dataset/mid360s_mvs_$(date +%F_%H-%M-%S).bag --lz4 /livox/lidar /livox/imu /left_camera/image
 # 回放数据
-rosbag play dataset/mid360s_mvs_2026-03-22_17-20-17.bag
+rosbag play dataset/livo_2026-07-25-22-50-36.bag
 # 查看话题频率
 rostopic hz /livox/lidar /livox/imu /left_camera/image
+
+# 数据可视化
+roslaunch rosbridge_server rosbridge_websocket.launch
 ```

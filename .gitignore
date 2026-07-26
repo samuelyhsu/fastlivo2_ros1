@@ -3,3 +3,4 @@ devel/
 .vscode/
 dataset/
 .venv/
+vcpkg_installed/

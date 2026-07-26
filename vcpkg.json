@@ -1,0 +1,13 @@
+{
+  "name": "fastlivo2-ros1",
+  "version-string": "0.1.0",
+  "description": "Third-party C++ dependencies for the FAST-LIVO2 ROS1 workspace, managed via vcpkg manifest mode. Only libraries that ROS does NOT also provide belong here to avoid ABI conflicts with system PCL/OpenCV/Eigen. If a library is an indirect dependency of one required here—for example, Sophus depends on Eigen3—then its version should be aligned with the version installed on the system.",
+  "builtin-baseline": "cd61e1e26a038e82d6550a3ebbe0fbbfe7da78e3",
+  "dependencies": ["sophus", "eigen3"],
+  "overrides": [
+    {
+      "name": "eigen3",
+      "version": "3.3.7#8"
+    }
+  ]
+}
