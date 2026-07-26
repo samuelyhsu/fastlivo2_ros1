@@ -71,9 +71,68 @@ def load_traj(path):
 
 
 def rot_angle_deg(qa, qb):
-    """两个四元数 (qx,qy,qz,qw) 之间的相对旋转角。"""
-    dot = abs(sum(a * b for a, b in zip(qa, qb)))
-    return 2.0 * math.degrees(math.acos(min(1.0, dot)))
+    """两个四元数 (qx,qy,qz,qw) 之间的相对旋转角。
+
+    两处都必须讲究，否则轨迹完全相同也报不出 0：
+
+    - 先归一化。轨迹文件只写 6 位小数，四元数落盘后不再是单位长度（实测模平方
+      约 0.999998），不归一化会把这点量化误差当成旋转差，自己跟自己比就有 0.18°。
+    - 用相对四元数 + atan2，而不是点积 + acos。acos 在自变量趋近 1 时条件数极差，
+      即便归一化过，同一条轨迹自比仍会残留约 2e-06 度；而两条轨迹相同时相对四元数
+      的虚部逐项精确抵消为 0，atan2(0, |w|) 恰好给出 0。
+    """
+    ax, ay, az, aw = qa
+    bx, by, bz, bw = qb
+    na = math.sqrt(ax * ax + ay * ay + az * az + aw * aw)
+    nb = math.sqrt(bx * bx + by * by + bz * bz + bw * bw)
+    if na == 0.0 or nb == 0.0:
+        return 0.0
+    ax, ay, az, aw = ax / na, ay / na, az / na, aw / na
+    bx, by, bz, bw = bx / nb, by / nb, bz / nb, bw / nb
+
+    # q_rel = conj(qa) * qb；取 |w| 是因为 q 与 -q 表示同一旋转
+    rw = aw * bw + ax * bx + ay * by + az * bz
+    rx = aw * bx - ax * bw - ay * bz + az * by
+    ry = aw * by - ay * bw - az * bx + ax * bz
+    rz = aw * bz - az * bw - ax * by + ay * bx
+    return 2.0 * math.degrees(
+        math.atan2(math.sqrt(rx * rx + ry * ry + rz * rz), abs(rw)))
+
+
+def closure_error(traj):
+    """末点相对世界原点的位置/姿态偏差，返回 (米, 度)。
+
+    测试数据通常绕一圈回到起点，而 FAST-LIVO2 的世界系锚定在首帧，
+    所以"末点离原点多远、姿态偏了多少"直接就是这一趟的累计漂移。
+
+    只打印不判定：它衡量的是算法精度，与本工具要回答的"改动有没有改变行为"
+    是两个问题。判定该指标会把"算法本来就有的漂移"误报成回归。
+    """
+    last = traj[max(traj)]
+    return (math.dist(last[:3], (0.0, 0.0, 0.0)),
+            rot_angle_deg(last[3:], (0.0, 0.0, 0.0, 1.0)))
+
+
+def start_offset(traj):
+    """首点离原点的距离。不接近 0 说明这条轨迹压根不是从原点起步，
+    此时 closure_error 量的就不是闭环误差，得提醒一句。"""
+    return math.dist(traj[min(traj)][:3], (0.0, 0.0, 0.0))
+
+
+def print_closure(rows):
+    """rows: [(标签, traj), ...]，同一张表里并排打印各条轨迹的闭环误差。"""
+    print("\nLoop closure   (not judged, this is algorithm accuracy)")
+    table = [["metric"] + [label for label, _ in rows]]
+    table.append(["Distance from origin [m]"]
+                 + [fmt(closure_error(t)[0]) for _, t in rows])
+    table.append(["Rotation from origin [deg]"]
+                 + [fmt(closure_error(t)[1]) for _, t in rows])
+    print_table(table, ["<"] + [">"] * len(rows))
+    for label, traj in rows:
+        off = start_offset(traj)
+        if off > 0.05:
+            print(f"  ! {label} starts {fmt(off)} m from the origin, "
+                  f"so the numbers above are not a loop-closure error")
 
 
 def compare(a, b):
@@ -194,6 +253,9 @@ def cmd_build_baseline(args):
         "safety_factor": args.safety,
         "observed": {k: round(v, 4) for k, v in observed.items()},
         "threshold": {k: round(v, 4) for k, v in threshold.items()},
+        # 中位轨迹的闭环误差，仅供参考，不参与判定
+        "closure": dict(zip(("pos_m", "rot_deg"),
+                            (round(v, 4) for v in closure_error(trajs[medoid])))),
     }
     with open(os.path.join(args.dir, "meta.json"), "w") as fh:
         json.dump(meta, fh, indent=2, ensure_ascii=False)
@@ -210,6 +272,8 @@ def cmd_build_baseline(args):
         rows.append([label_of(label, unit), fmt(observed[key]), fmt(threshold[key]),
                      "" if judged else "(not judged)"])
     print_table(rows, ["<", ">", ">", "<"])
+
+    print_closure([(f"run {i + 1}", t) for i, t in enumerate(trajs)])
 
     if len(trajs) == 2:
         print("\n  ! only 2 runs = 1 pair, the noise estimate is optimistic; use -r 3 or more")
@@ -303,12 +367,14 @@ def cmd_check(args):
         print(f"  ! this baseline predates {', '.join(stale)}; "
               f"rebuild it to get the threshold for those")
 
+    print_closure([("measured", cand), ("baseline", base)])
+
     if failures:
         print("\n=> FAIL")
         for f in failures:
             print(f"   - {f}")
         return EXIT_FAIL
-    print("\n=> PASS   no change in behaviour (drift stays within the noise baseline)")
+    print("\n=> PASS   no change in behaviour (every judged metric is within its threshold)")
     if marginal:
         print("   ! little margin left, the baseline noise may be underestimated; "
               "rebuild with -r 5")

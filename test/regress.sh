@@ -2,10 +2,10 @@
 # ============================================================
 #  FAST-LIVO2 one-shot regression test
 #
-#  FAST-LIVO2 is not reproducible (the OpenMP float reduction in vio.cpp feeds
-#  the iteration convergence test), two runs at the same rate already differ by
-#  about 5 cm at the last pose. So the verdict is not "the pose is identical"
-#  but "the drift stays within the noise baseline".
+#  Repeated runs on the same data are byte-identical, so the verdict really is
+#  "the pose did not move": the noise measured while building a baseline is 0,
+#  hence so are the thresholds. (That holds only since the two undefined
+#  behaviours in vio.cpp were fixed on 2026-07-26 -- see readme.md.)
 #
 #  Usage (symlink into ~/.local/bin/ to call it from anywhere):
 #     # before changing code: 3 runs at 1x -> baseline trajectory + thresholds
@@ -411,36 +411,22 @@ print(m.get("cam_cfg", ""))' "$dir/meta.json")
   ensure_roscore
   mark "roscore" "$t_stage"
 
-  # FAIL 需要复现才算数。FAST-LIVO2 的不确定性是重尾的：实测 13 轮 check 中
-  # 有 1 轮偏差达中位数的 18 倍（单轮误报率约 8%），且 1x/5x 都会出现。
-  # 放松阈值会让工具测不出真回归，所以改为首轮 FAIL 时复测一次，
-  # 两轮都 FAIL 才判定回归；连续两次抽到长尾的概率约 0.6%。
-  local attempt rc=0
-  for attempt in 1 2; do
-    run_once "$RATE" "check$attempt" "$bag"
-    backlog_check
-    rc=0
-    t_stage=$(now)
-    python3 "$PY" check \
-      --dir "$dir" --traj "$R_TRAJ" \
-      --lidar-frames "$R_LIDAR" --valid-images "$R_IMAGES" --traj-points "$R_POINTS" \
-      --bag-size "$(stat -c %s "$bag")" \
-      --bag-topics "$(bag_topics_json "$bag")" \
-      --host "$(hostname)" --cfg "$CFG" --cam-cfg "$CAM_CFG" || rc=$?
-    mark "bag scan + compare" "$t_stage"
+  # 跑一轮就够：同一份数据重复运行的输出逐字节一致（见 readme），
+  # FAIL 不会是抽样噪声。历史上这里会在 FAIL 时复测一次，理由是"算法的
+  # 不确定性是重尾的、单轮误报率约 8%"——那个不确定性来自两个未定义行为，
+  # 已于 2026-07-26 修掉，复测只是白跑一轮。
+  local rc=0
+  run_once "$RATE" "check" "$bag"
+  backlog_check
+  t_stage=$(now)
+  python3 "$PY" check \
+    --dir "$dir" --traj "$R_TRAJ" \
+    --lidar-frames "$R_LIDAR" --valid-images "$R_IMAGES" --traj-points "$R_POINTS" \
+    --bag-size "$(stat -c %s "$bag")" \
+    --bag-topics "$(bag_topics_json "$bag")" \
+    --host "$(hostname)" --cfg "$CFG" --cam-cfg "$CAM_CFG" || rc=$?
+  mark "bag scan + compare" "$t_stage"
 
-    # 只有"指标越界"才复测；环境错误(2)直接返回
-    [[ $rc -eq $EXIT_FAIL ]] || break
-    if [[ $attempt -eq 1 ]]; then
-      echo
-      warn "first attempt FAILed. The algorithm has a heavy-tailed run-to-run spread, so a single run can be a false alarm; re-running once to confirm ..."
-    fi
-  done
-
-  if [[ $rc -eq $EXIT_FAIL ]]; then
-    echo
-    warn "both attempts FAILed, this is a real regression."
-  fi
   print_stages
   exit "$rc"
 }
