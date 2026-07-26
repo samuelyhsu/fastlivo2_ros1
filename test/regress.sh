@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
 # ============================================================
-#  FAST-LIVO2 一键回归测试
+#  FAST-LIVO2 one-shot regression test
 #
-#  FAST-LIVO2 的输出不可复现（vio.cpp 的 OpenMP 浮点归约影响迭代收敛判断），
-#  同倍速重跑两次末帧就差约 5cm。所以判据不是"位姿完全不变"，
-#  而是"偏差落在噪声基线内"。
+#  FAST-LIVO2 is not reproducible (the OpenMP float reduction in vio.cpp feeds
+#  the iteration convergence test), two runs at the same rate already differ by
+#  about 5 cm at the last pose. So the verdict is not "the pose is identical"
+#  but "the drift stays within the noise baseline".
 #
-#  用法（可软链到 ~/.local/bin/ 后任意目录调用）:
-#     # 改代码前：跑 3 轮 1x，生成基线轨迹 + 噪声阈值
+#  Usage (symlink into ~/.local/bin/ to call it from anywhere):
+#     # before changing code: 3 runs at 1x -> baseline trajectory + thresholds
 #     regress.sh baseline dataset/livo_2026-07-25-22-50-36.bag
 #
-#     # 改代码后：跑 1 轮 5x 与基线对比
+#     # after changing code: 1 run at 5x, compared against the baseline
 #     regress.sh check
 #
-#     regress.sh list                       # 列出已有基线
-#     regress.sh baseline <bag> -n 名字 -r 5  # 指定基线名与轮数
-#     regress.sh check -n 名字 --rate 1       # 指定基线与回放倍速
+#     regress.sh list                        # list existing baselines
+#     regress.sh baseline <bag> -n NAME -r 5 # baseline name and run count
+#     regress.sh check -n NAME --rate 1      # baseline name and replay rate
 #     regress.sh baseline <bag> --cfg avia.yaml --cam-cfg camera_pinhole.yaml
 #
-#  退出码: 0=PASS  1=FAIL  2=环境/运行错误  3=结果不可信(检测到积压)
+#  One dataset, one baseline: every -n NAME is a directory baseline/NAME/ and
+#  its meta.json records the bag path and the config files. So check only needs
+#  the baseline name: dataset and config follow it (pass --cfg/--cam-cfg to
+#  override). With more than one baseline, check requires -n.
+#
+#  Exit codes: 0=PASS  1=FAIL  2=environment/run error  3=unreliable (backlog)
 # ============================================================
 set -euo pipefail
 
@@ -39,6 +45,8 @@ STABLE_NEED=3 # 连续多少次行数不变才算排空完成
 
 CFG="mid360.yaml"
 CAM_CFG="camera_pinhole_mid360.yaml"
+CFG_SET=false     # 命令行显式指定过 --cfg
+CAM_CFG_SET=false # 命令行显式指定过 --cam-cfg
 SAFETY=2.0
 RUNS=3
 RATE=5
@@ -59,13 +67,53 @@ usage() {
   sed -n '2,${/^#/!q; s/^# \{0,1\}//p;}' "$SELF"
 }
 
+# ---------- 阶段计时 ----------
+# 加速回放只压缩"replay"这一段，其余都是与倍速无关的固定开销，
+# 所以按阶段记账，才看得出继续加倍速还有没有意义。
+# 用法: t0=$(now); ...; mark "阶段名" "$t0"    同名多次调用自动累加（跑 N 轮时）
+SCRIPT_T0=$(date +%s.%N)
+STAGE_ORDER=()
+declare -A STAGE_SUM=()
+
+now() { date +%s.%N; }
+
+mark() {
+  local name="$1" dt
+  dt=$(echo "$(now) - $2" | bc)
+  if [[ -z "${STAGE_SUM[$name]:-}" ]]; then
+    STAGE_ORDER+=("$name")
+    STAGE_SUM["$name"]="$dt"
+  else
+    STAGE_SUM["$name"]=$(echo "${STAGE_SUM[$name]} + $dt" | bc)
+  fi
+}
+
+print_stages() {
+  [[ ${#STAGE_ORDER[@]} -gt 0 ]] || return 0
+  local wall acc=0 name
+  wall=$(echo "$(now) - $SCRIPT_T0" | bc)
+  for name in "${STAGE_ORDER[@]}"; do
+    acc=$(echo "$acc + ${STAGE_SUM[$name]}" | bc)
+  done
+  echo
+  log "time breakdown"
+  for name in "${STAGE_ORDER[@]}"; do
+    printf '      %-26s %7.2f s  %5.1f%%\n' \
+      "$name" "${STAGE_SUM[$name]}" "$(echo "scale=4; 100 * ${STAGE_SUM[$name]} / $wall" | bc)"
+  done
+  # 未计入的零碎：source 环境、参数解析、进程间的空隙
+  printf '      %-26s %7.2f s  %5.1f%%\n' \
+    "unaccounted" "$(echo "$wall - $acc" | bc)" "$(echo "scale=4; 100 * ($wall - $acc) / $wall" | bc)"
+  printf '      %-26s %7.2f s\n' "TOTAL (wall clock)" "$wall"
+}
+
 # ---------- 清理 ----------
 ROSCORE_PID=""
 LAUNCH_PID=""
 RSS_PID=""
 
 # set -e 静默退出很难排查，明确报出失败位置
-trap 'rc=$?; warn "第 $LINENO 行失败（退出码 $rc）: ${BASH_COMMAND}"' ERR
+trap 'rc=$?; warn "line $LINENO failed (exit $rc): ${BASH_COMMAND}"' ERR
 
 cleanup() {
   trap - INT TERM EXIT ERR
@@ -85,18 +133,29 @@ trap cleanup INT TERM EXIT
 
 ensure_roscore() {
   if rostopic list &>/dev/null; then
-    log "复用已有 roscore"
+    log "reusing the running roscore"
     return
   fi
-  log "启动 roscore ..."
+  log "starting roscore ..."
   roscore >"$WORK/roscore.log" 2>&1 &
   ROSCORE_PID=$!
   for _ in $(seq 1 30); do
     rostopic list &>/dev/null && return
-    kill -0 "$ROSCORE_PID" 2>/dev/null || err "roscore 启动失败，见 $WORK/roscore.log"
+    kill -0 "$ROSCORE_PID" 2>/dev/null || err "roscore failed to start, see $WORK/roscore.log"
     sleep 1
   done
-  err "roscore 启动超时"
+  err "roscore start timed out"
+}
+
+# SIGKILL 掉的节点不会自己从 master 注销，残留项会让下一轮的"等节点起来/
+# 等订阅上"直接假阳性通过、提前开播丢帧。这里按名字定点清掉它们的注册。
+# 必须在 roslaunch 退出后调用，否则会把还活着的节点从 master 上摘掉。
+purge_dead_nodes() {
+  python3 - <<'PYEOF' >/dev/null 2>&1 || true
+import rosgraph, rosnode
+rosnode.cleanup_master_blacklist(rosgraph.Master("/regress_purge"),
+                                 ["/laserMapping", "/republish"])
+PYEOF
 }
 
 bag_topics_json() {
@@ -121,6 +180,12 @@ run_once() {
   mkdir -p "$TRAJ_OUT"
   rm -f "$traj_src" "$node_log" "$rss_csv"
 
+  # 上一次异常中断（或外部 kill -9）会在 master 里留下残留注册，
+  # 那会让下面"等节点起来"瞬间假阳性通过，于是没人订阅就开播，整轮空跑。
+  purge_dead_nodes
+
+  local t_stage
+  t_stage=$(now)
   roslaunch "$TEST_DIR/regress.launch" \
     seq:="$seq" cfg:="$CFG" cam_cfg:="$CAM_CFG" >"$node_log" 2>&1 &
   LAUNCH_PID=$!
@@ -135,8 +200,10 @@ run_once() {
     kill -0 "$LAUNCH_PID" 2>/dev/null || break
     sleep 0.5
   done
-  [[ "$up" == true ]] || err "建图节点未启动，见 $node_log"
+  [[ "$up" == true ]] || err "mapping node did not start, see $node_log"
+  mark "node startup" "$t_stage"
 
+  t_stage=$(now)
   local lid_topic
   lid_topic=$(rosparam get /common/lid_topic 2>/dev/null | tr -d "'\"" || true)
   if [[ -n "$lid_topic" ]]; then
@@ -146,11 +213,12 @@ run_once() {
     done
   fi
   sleep 2
+  mark "wait for subscription" "$t_stage"
 
   # 用 pgrep -o 取最早的匹配进程，避免 `pgrep | head -1` 在 pipefail 下的 SIGPIPE
   local node_pid
   node_pid=$(pgrep -of fastlivo_mapping || true)
-  [[ -n "$node_pid" ]] || err "找不到 fastlivo_mapping 进程"
+  [[ -n "$node_pid" ]] || err "cannot find the fastlivo_mapping process"
 
   # 子 shell 里不能用 local，这里全部用普通变量
   (
@@ -164,12 +232,13 @@ run_once() {
   ) >"$rss_csv" 2>/dev/null &
   RSS_PID=$!
 
-  log "回放 ${rate}x ..."
+  log "replaying at ${rate}x ..."
   local t_play_start t_play_end
   t_play_start=$(date +%s.%N)
   rosbag play -r "$rate" --queue 10000 "$bag" >"$WORK/play_$label.log" 2>&1
   t_play_end=$(date +%s.%N)
   R_PLAY=$(echo "$t_play_end - $t_play_start" | bc)
+  mark "bag replay (${rate}x)" "$t_play_start"
 
   # 排空：轮询轨迹行数直到连续 STABLE_NEED 次不变
   local prev=-1 cur stable=0
@@ -185,10 +254,12 @@ run_once() {
     kill -0 "$node_pid" 2>/dev/null || break
     sleep "$POLL"
   done
+  mark "queue drain" "$t_play_end"
   R_DRAIN=$(echo "$(date +%s.%N) - $t_play_end - $STABLE_NEED * $POLL" | bc)
   # 减去稳定判定本身的开销，负数归零
   [[ $(echo "$R_DRAIN < 0" | bc) == 1 ]] && R_DRAIN=0
 
+  t_stage=$(now)
   kill "$RSS_PID" 2>/dev/null || true
   RSS_PID=""
 
@@ -210,18 +281,26 @@ run_once() {
   else
     R_IMAGES=0
   fi
+  mark "parse node log" "$t_stage"
 
+  # 建图节点自己退出要 ~17s：析构那张 1.4GB 的体素地图。而此刻轨迹已经逐帧
+  # open/append/endl/close 落盘、日志也已解析完，它的退出过程再没有我们要的
+  # 东西，所以直接 SIGKILL。实测把单轮收尾从 15.8s 压到 0.3s。
+  t_stage=$(now)
+  kill -9 "$node_pid" 2>/dev/null || true
   kill -INT "$LAUNCH_PID" 2>/dev/null || true
   wait "$LAUNCH_PID" 2>/dev/null || true
   LAUNCH_PID=""
+  purge_dead_nodes
+  mark "node shutdown" "$t_stage"
 
-  [[ -s "$traj_src" ]] || err "未产出轨迹，见 $node_log"
+  [[ -s "$traj_src" ]] || err "no trajectory produced, see $node_log"
   R_TRAJ="$WORK/traj_$label.txt"
   mv "$traj_src" "$R_TRAJ"
   R_POINTS=$(wc -l <"$R_TRAJ")
 
-  log "play ${R_PLAY}s  排空 ${R_DRAIN}s  RSS峰值 ${R_RSS_PEAK}MB  斜率 ${R_RSS_SLOPE}MB/s"
-  log "LiDAR $R_LIDAR  有效图像 $R_IMAGES  轨迹点 $R_POINTS"
+  log "replay ${R_PLAY} s  drain ${R_DRAIN} s  RSS peak ${R_RSS_PEAK} MB  slope ${R_RSS_SLOPE} MB/s"
+  log "LiDAR ${R_LIDAR} frames  valid images ${R_IMAGES}  trajectory points ${R_POINTS}"
 }
 
 # 只用排空耗时判积压。RSS 斜率仅作参考打印，不作判据：
@@ -229,8 +308,9 @@ run_once() {
 # 无法把"地图增长"和"buffer 积压"区分开，用作判据必然误报。
 backlog_check() {
   if [[ $(echo "$R_DRAIN > $DRAIN_LIMIT" | bc) == 1 ]]; then
-    warn "排空耗时 ${R_DRAIN}s 超过 ${DRAIN_LIMIT}s，算法跟不上 ${RATE}x —— 消息在 buffer 里积压"
-    warn "结果不可信 —— 既不能证明变了、也不能证明没变。请用 --rate 1 重跑。"
+    warn "drain took ${R_DRAIN} s, over the ${DRAIN_LIMIT} s limit: the algorithm cannot keep up with ${RATE}x, messages piled up in the buffer"
+    warn "result is unreliable, it proves neither a change nor the absence of one. Re-run with --rate 1."
+    print_stages
     exit "$EXIT_UNRELIABLE"
   fi
 }
@@ -248,39 +328,43 @@ resolve_baseline() {
     done
   fi
   case ${#found[@]} in
-  0) err "没有任何基线。先跑: $(basename "$SELF") baseline <bag>" ;;
+  0) err "no baseline yet. Run: $(basename "$SELF") baseline <bag>" ;;
   1) echo "$BASELINE_ROOT/${found[0]}" ;;
-  *) err "有多套基线，请用 -n 指定: ${found[*]}" ;;
+  *) err "several baselines, pick one with -n: ${found[*]}" ;;
   esac
 }
 
 # ---------- 子命令 ----------
 cmd_baseline() {
   local bag="${1:-}"
-  [[ -n "$bag" ]] || err "用法: $(basename "$SELF") baseline <bag> [-n 名字] [-r 轮数]"
+  [[ -n "$bag" ]] || err "usage: $(basename "$SELF") baseline <bag> [-n NAME] [-r RUNS]"
   shift
   parse_flags "$@"
-  [[ -f "$bag" ]] || err "bag 不存在: $bag"
+  [[ -f "$bag" ]] || err "no such bag: $bag"
   bag="$(readlink -f "$bag")"
   [[ -n "$NAME" ]] || NAME="$(basename "$bag" .bag)"
 
+  local t_stage
+  t_stage=$(now)
   ensure_roscore
-  log "基线 '$NAME'：$RUNS 轮 1x，$(basename "$bag")"
+  mark "roscore" "$t_stage"
+  log "baseline '$NAME': $RUNS runs at 1x on $(basename "$bag")"
 
   local trajs=() i
   local lidar="" images="" points=""
   for i in $(seq 1 "$RUNS"); do
-    log "--- 第 $i/$RUNS 轮 ---"
+    log "--- run $i/$RUNS ---"
     run_once 1 "base$i" "$bag"
     trajs+=("$R_TRAJ")
     if [[ -z "$lidar" ]]; then
       lidar="$R_LIDAR" images="$R_IMAGES" points="$R_POINTS"
     elif [[ "$lidar" != "$R_LIDAR" || "$images" != "$R_IMAGES" || "$points" != "$R_POINTS" ]]; then
-      err "第 $i 轮帧数与前几轮不一致（LiDAR $R_LIDAR/$lidar 图像 $R_IMAGES/$images 轨迹 $R_POINTS/$points）——
-    环境本身不稳定，基线不可信。检查是否有别的进程抢 CPU，或改用 1x 重跑。"
+      err "run $i disagrees with the earlier runs (LiDAR $R_LIDAR/$lidar frames, images $R_IMAGES/$images, trajectory $R_POINTS/$points points) --
+    the machine itself is unstable, so the baseline would be worthless. Check for other processes eating CPU, or re-run at 1x."
     fi
   done
 
+  t_stage=$(now)
   python3 "$PY" build-baseline \
     --dir "$BASELINE_ROOT/$NAME" \
     --traj "${trajs[@]}" \
@@ -293,19 +377,39 @@ cmd_baseline() {
     --submodule-commit "$(git -C "$WS/src/FAST-LIVO2" rev-parse --short HEAD 2>/dev/null || echo '')" \
     --host "$(hostname)" --rate 1 \
     --lidar-frames "$lidar" --valid-images "$images" --traj-points "$points"
+  mark "bag scan + compare" "$t_stage"
+
+  print_stages
 }
 
 cmd_check() {
   parse_flags "$@"
   local dir
   dir="$(resolve_baseline)"
-  [[ -f "$dir/meta.json" ]] || err "基线不存在: $dir"
+  [[ -f "$dir/meta.json" ]] || err "no such baseline: $dir"
 
-  local bag
-  bag="$WS/$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["bag"]["path"])' "$dir/meta.json")"
-  [[ -f "$bag" ]] || err "基线记录的 bag 不存在: $bag"
+  # 数据源与配置都从基线里取：换数据集只需换 -n，不必每次重写 --cfg。
+  # 命令行显式给过的以命令行为准（用于"就是要拿另一套配置比一比"的场景，
+  # compare_traj.py 会因配置名不符直接报错，这正是期望行为）。
+  local meta_vals=()
+  mapfile -t meta_vals < <(python3 -c '
+import json, sys
+m = json.load(open(sys.argv[1]))
+print(m["bag"]["path"])
+print(m.get("cfg", ""))
+print(m.get("cam_cfg", ""))' "$dir/meta.json")
+  [[ ${#meta_vals[@]} -ge 3 ]] || err "cannot parse baseline meta.json: $dir/meta.json"
 
+  local bag="$WS/${meta_vals[0]}"
+  [[ -f "$bag" ]] || err "the bag recorded in the baseline is missing: $bag"
+  if [[ "$CFG_SET" != true && -n "${meta_vals[1]}" ]]; then CFG="${meta_vals[1]}"; fi
+  if [[ "$CAM_CFG_SET" != true && -n "${meta_vals[2]}" ]]; then CAM_CFG="${meta_vals[2]}"; fi
+  log "dataset $(basename "$bag")  config $CFG + $CAM_CFG"
+
+  local t_stage
+  t_stage=$(now)
   ensure_roscore
+  mark "roscore" "$t_stage"
 
   # FAIL 需要复现才算数。FAST-LIVO2 的不确定性是重尾的：实测 13 轮 check 中
   # 有 1 轮偏差达中位数的 18 倍（单轮误报率约 8%），且 1x/5x 都会出现。
@@ -316,25 +420,28 @@ cmd_check() {
     run_once "$RATE" "check$attempt" "$bag"
     backlog_check
     rc=0
+    t_stage=$(now)
     python3 "$PY" check \
       --dir "$dir" --traj "$R_TRAJ" \
       --lidar-frames "$R_LIDAR" --valid-images "$R_IMAGES" --traj-points "$R_POINTS" \
       --bag-size "$(stat -c %s "$bag")" \
       --bag-topics "$(bag_topics_json "$bag")" \
       --host "$(hostname)" --cfg "$CFG" --cam-cfg "$CAM_CFG" || rc=$?
+    mark "bag scan + compare" "$t_stage"
 
     # 只有"指标越界"才复测；环境错误(2)直接返回
     [[ $rc -eq $EXIT_FAIL ]] || break
     if [[ $attempt -eq 1 ]]; then
       echo
-      warn "首轮 FAIL。算法存在重尾不确定性，单轮可能误报，复测一次确认 ..."
+      warn "first attempt FAILed. The algorithm has a heavy-tailed run-to-run spread, so a single run can be a false alarm; re-running once to confirm ..."
     fi
   done
 
   if [[ $rc -eq $EXIT_FAIL ]]; then
     echo
-    warn "两轮均 FAIL —— 判定为真实回归。"
+    warn "both attempts FAILed, this is a real regression."
   fi
+  print_stages
   exit "$rc"
 }
 
@@ -359,17 +466,19 @@ parse_flags() {
       ;;
     --cfg)
       CFG="$2"
+      CFG_SET=true
       shift 2
       ;;
     --cam-cfg)
       CAM_CFG="$2"
+      CAM_CFG_SET=true
       shift 2
       ;;
     -h | --help)
       usage
       exit 0
       ;;
-    *) err "未知参数: $1" ;;
+    *) err "unknown option: $1" ;;
     esac
   done
 }
@@ -396,5 +505,5 @@ list) python3 "$PY" list --root "$BASELINE_ROOT" ;;
   usage
   exit 0
   ;;
-*) err "未知子命令: $SUB（可用: baseline / check / list）" ;;
+*) err "unknown subcommand: $SUB (available: baseline / check / list)" ;;
 esac

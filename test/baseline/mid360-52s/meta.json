@@ -1,6 +1,6 @@
 {
   "name": "mid360-52s",
-  "created": "2026-07-26T12:22:52+08:00",
+  "created": "2026-07-26T19:00:02+08:00",
   "bag": {
     "path": "dataset/livo_2026-07-25-22-50-36.bag",
     "size_bytes": 257450182,
@@ -12,27 +12,29 @@
   },
   "cfg": "mid360.yaml",
   "cam_cfg": "camera_pinhole_mid360.yaml",
-  "commit": "5560045",
-  "submodule_commit": "d1c113b",
+  "commit": "c997e6d",
+  "submodule_commit": "1a47456",
   "host": "uplume",
   "runs": 3,
   "rate": 1.0,
   "hard": {
     "lidar_frames": 508,
     "valid_images": 507,
-    "traj_points": 504
+    "traj_points": 505
   },
   "safety_factor": 2.0,
   "observed": {
-    "pos_rmse": 0.0426,
-    "final": 0.0477,
-    "max": 0.2416,
-    "max_rot_deg": 4.8114
+    "pos_rmse": 0.0311,
+    "final": 0.0372,
+    "max": 0.1712,
+    "final_rot_deg": 0.5338,
+    "max_rot_deg": 2.755
   },
   "threshold": {
-    "pos_rmse": 0.0851,
-    "final": 0.0954,
-    "max": 0.4832,
-    "max_rot_deg": 9.6228
+    "pos_rmse": 0.0622,
+    "final": 0.0743,
+    "max": 0.3424,
+    "final_rot_deg": 1.0676,
+    "max_rot_deg": 5.51
   }
 }

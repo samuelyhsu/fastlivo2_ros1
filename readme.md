@@ -62,15 +62,33 @@ roslaunch rosbridge_server rosbridge_websocket.launch
 # 改代码前：用指定数据源跑 3 轮 1x，生成基线轨迹 + 噪声阈值（约 3.5 分钟）
 ./test/regress.sh baseline dataset/livo_2026-07-25-22-50-36.bag -n mid360-52s
 
-# 改代码后：跑 1 轮 5x 与基线对比（约 25 秒）
-./test/regress.sh check
+# 改代码后：跑 1 轮 8x， 与基线对比
+./test/regress.sh check -n mid360-52s --rate 8
 
-./test/regress.sh list                # 查看已有基线
-./test/regress.sh check --rate 1      # 用 1x 对比
-./test/regress.sh baseline <bag> -r 5 # 基线跑 5 轮
+./test/regress.sh list                     # 查看已有基线
+./test/regress.sh check -n 名字 --rate 1    # 用 1x 对比
+./test/regress.sh baseline <bag> -r 5      # 基线跑 5 轮
 ```
 
 退出码：`0`=PASS `1`=FAIL `2`=环境错误 `3`=结果不可信（检测到积压）。
+
+### 一套数据一套基线
+
+`-n` 名字对应 `test/baseline/名字/` 一个目录，多套基线可并存：
+
+```bash
+./test/regress.sh baseline dataset/livo_2026-07-25-22-50-36.bag -n mid360-52s
+./test/regress.sh baseline dataset/avia_office.bag -n avia-office \
+  --cfg avia.yaml --cam-cfg camera_pinhole.yaml
+
+./test/regress.sh check -n avia-office     # 数据与配置自动跟着基线走
+```
+
+check 只给基线名，不给 bag：bag 路径、`--cfg`、`--cam-cfg` 都记在基线的
+`meta.json` 里，脚本据此回放对应数据、加载对应配置（显式传 `--cfg/--cam-cfg`
+可覆盖）。bag 的字节数与各话题消息数也会校验，换过数据会直接报"数据源不一致"。
+
+只有一套基线时 `-n` 可省略；有多套时不指定会报错并列出可选名字。
 
 ### 判据不是"位姿完全不变"
 
@@ -80,8 +98,8 @@ run-to-run 不固定，而 `error` 参与迭代收敛判断，某帧跨过阈值
 实测同倍速重跑两次，末帧就差约 5cm、最大偏差约 18cm。
 
 所以脚本比的是"偏差是否落在噪声基线内"。基线阶段跑 N 轮两两对比测出噪声，
-乘安全系数 2 得到阈值；判定用位置 RMSE、最大偏差、最大姿态偏差三项
-（末帧偏差方差过大，只打印不判定）。
+乘安全系数 2 得到阈值；判定用位置 RMSE、最大偏差、最大姿态偏差三项。
+末帧偏差（位置与姿态，均取最后一个共同时间戳）方差过大，只打印不判定。
 
 ### 两个必须知道的限制
 

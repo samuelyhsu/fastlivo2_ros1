@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
-"""FAST-LIVO2 回归测试：轨迹对比、阈值计算与判定。
+"""FAST-LIVO2 regression test: trajectory comparison, thresholds and verdict.
 
-由 regress.sh 调用，也可单独使用。位置单位 m，姿态单位 deg。
+Called by regress.sh, also usable standalone.
+Positions are in meters, rotations in degrees.
 
-子命令：
-  build-baseline  N 条轨迹 -> 阈值 + 中位轨迹 + meta.json
-  check           基线 + 候选轨迹 -> 判定表，PASS/FAIL
-  list            列出所有基线
-  rss-slope       RSS 采样 csv -> 后半段线性拟合斜率 (MB/s)
+Subcommands:
+  build-baseline  N trajectories -> thresholds + medoid trajectory + meta.json
+  check           baseline + candidate trajectory -> verdict table, PASS/FAIL
+  list            list all baselines
+  rss-slope       RSS sample csv -> slope of second half, linear fit (MB/s)
 
-退出码：0=PASS  1=FAIL  2=错误
+Exit codes: 0=PASS  1=FAIL  2=ERROR
 """
 
 import argparse
@@ -20,17 +21,18 @@ import sys
 import unicodedata
 from datetime import datetime, timezone
 
-# (key, 显示名, 单位, 是否参与判定)，顺序即打印顺序
+# (key, 显示名, 列表短名, 单位, 是否参与判定)，顺序即打印顺序
 #
-# 末帧偏差只打印不判定：它恒 <= 最大偏差（同一组逐帧距离的末值 vs 最大值），
-# 能报的问题最大偏差都能报；但它由"最后一次分叉恰好发生在何处"主导，
-# 实测跨度约 10 倍（0.03~0.28），最大偏差只有 2.6 倍（0.11~0.29）。
-# 用它做判据只会在无任何改动时误报。
+# 末帧偏差（位置与姿态）只打印不判定：它恒 <= 对应的最大偏差（同一组逐帧
+# 距离的末值 vs 最大值），能报的问题最大偏差都能报；但它由"最后一次分叉
+# 恰好发生在何处"主导，实测跨度约 10 倍（0.03~0.28），最大偏差只有
+# 2.6 倍（0.11~0.29）。用它做判据只会在无任何改动时误报。
 METRICS = [
-    ("pos_rmse", "位置 RMSE", "m", True),
-    ("final", "末帧偏差", "m", False),
-    ("max", "最大偏差", "m", True),
-    ("max_rot_deg", "最大姿态偏差", "deg", True),
+    ("pos_rmse", "Position RMSE", "rmse", "m", True),
+    ("final", "Final drift", "final", "m", False),
+    ("max", "Max drift", "max", "m", True),
+    ("final_rot_deg", "Final rotation drift", "final rot", "deg", False),
+    ("max_rot_deg", "Max rotation drift", "rot", "deg", True),
 ]
 
 # 判定通过但已占到阈值这么高的比例时提示：说明标定余量不足
@@ -57,13 +59,14 @@ def load_traj(path):
             if not parts:
                 continue
             if len(parts) != 8:
-                die(f"{path}:{lineno} 期望 8 列 TUM 格式，实际 {len(parts)} 列")
+                die(f"{path}:{lineno} expected 8 TUM columns, got {len(parts)}")
             try:
                 traj[parts[0]] = tuple(float(v) for v in parts[1:])
             except ValueError:
-                die(f"{path}:{lineno} 数值解析失败: {line.strip()}")
+                die(f"{path}:{lineno} cannot parse numbers: {line.strip()}")
     if not traj:
-        die(f"{path} 为空，节点可能未写出轨迹（检查 evo/pose_output_en）")
+        die(f"{path} is empty, the node may not have written a trajectory "
+            f"(check evo/pose_output_en)")
     return traj
 
 
@@ -77,23 +80,28 @@ def compare(a, b):
     """两条轨迹在共同时间戳上的指标。返回 (metrics, n_common)。"""
     keys = sorted(set(a) & set(b))
     if not keys:
-        die("两条轨迹没有共同时间戳，无法对比")
+        die("the two trajectories share no timestamp, cannot compare")
     pos = [math.dist(a[k][:3], b[k][:3]) for k in keys]
     rot = [rot_angle_deg(a[k][3:], b[k][3:]) for k in keys]
     return {
         "pos_rmse": math.sqrt(sum(d * d for d in pos) / len(pos)),
         "final": pos[-1],
         "max": max(pos),
+        "final_rot_deg": rot[-1],
         "max_rot_deg": max(rot),
     }, len(keys)
 
 
-def fmt(value, _unit):
+def fmt(value):
     return f"{value:.4f}"
 
 
+def label_of(label, unit):
+    return f"{label} [{unit}]"
+
+
 def width(text):
-    """终端显示宽度：CJK 字符占两列。"""
+    """终端显示宽度：CJK 字符占两列。基线名可能带中文，不能用 len()。"""
     return sum(2 if unicodedata.east_asian_width(c) in "WF" else 1 for c in text)
 
 
@@ -105,15 +113,27 @@ def rpad(text, n):
     return text + " " * max(0, n - width(text))
 
 
+def print_table(rows, aligns, indent="  ", gap=3):
+    """按内容自适应列宽打印。aligns 逐列给 '<'(左) 或 '>'(右)。
+
+    列宽取该列最宽单元格，所以加长指标名或多跑几位小数都不会错位。
+    """
+    widths = [max(width(row[i]) for row in rows) for i in range(len(aligns))]
+    for row in rows:
+        cells = [(lpad if a == ">" else rpad)(row[i], widths[i])
+                 for i, a in enumerate(aligns)]
+        print((indent + (" " * gap).join(cells)).rstrip())
+
+
 def cmd_build_baseline(args):
     if len(args.traj) < 2:
-        die("基线至少需要 2 条轨迹才能估计噪声，建议 3 条以上")
+        die("a baseline needs at least 2 trajectories to estimate noise, 3+ recommended")
 
     trajs = [load_traj(p) for p in args.traj]
 
     # 两两对比，每个指标取全组最大值作为观测噪声
     n = len(trajs)
-    observed = {key: 0.0 for key, _, _, _ in METRICS}
+    observed = {key: 0.0 for key, *_ in METRICS}
     rmse = [[0.0] * n for _ in range(n)]  # 两两 pos_rmse 矩阵
     rmse_sum = [0.0] * n
     for i in range(n):
@@ -139,8 +159,8 @@ def cmd_build_baseline(args):
             for i, d in enumerate(nearest):
                 if d / ref > 3.0:
                     contaminated.append(
-                        f"第 {i + 1} 轮：与最接近的另一轮相差 {fmt(d, 'm')}，"
-                        f"是其余轮次典型值 {fmt(ref, 'm')} 的 {d / ref:.1f} 倍")
+                        f"run {i + 1}: {fmt(d)} m from its closest neighbour, "
+                        f"{d / ref:.1f}x the typical {fmt(ref)} m of the other runs")
 
     threshold = {k: v * args.safety for k, v in observed.items()}
 
@@ -179,28 +199,34 @@ def cmd_build_baseline(args):
         json.dump(meta, fh, indent=2, ensure_ascii=False)
         fh.write("\n")
 
-    print(f"\n基线已生成: {args.dir}")
-    print(f"  轮数 {len(trajs)} @ {args.rate}x    中位轨迹 = 第 {medoid + 1} 轮")
-    print(f"  硬指标  LiDAR {args.lidar_frames}  有效图像 {args.valid_images}  轨迹点 {args.traj_points}")
-    print(f"\n  {rpad('指标', 18)}{lpad('实测噪声', 12)}{lpad(f'阈值(×{args.safety})', 16)}")
-    for key, label, unit, judged in METRICS:
-        note = "" if judged else "   (仅参考)"
-        print(f"  {rpad(label, 18)}{lpad(fmt(observed[key], unit), 12)}"
-              f"{lpad(fmt(threshold[key], unit), 16)}{note}")
+    print(f"\nBaseline written: {args.dir}")
+    print(f"  {len(trajs)} runs @ {args.rate}x, medoid = run {medoid + 1}")
+    print(f"  hard metrics  {args.lidar_frames} LiDAR frames, "
+          f"{args.valid_images} valid images, {args.traj_points} trajectory points")
+
+    print()
+    rows = [["metric", "observed noise", f"threshold (x{args.safety})", ""]]
+    for key, label, _short, unit, judged in METRICS:
+        rows.append([label_of(label, unit), fmt(observed[key]), fmt(threshold[key]),
+                     "" if judged else "(not judged)"])
+    print_table(rows, ["<", ">", ">", "<"])
+
     if len(trajs) == 2:
-        print("\n  ! 只有 2 轮 = 1 组对比，噪声估计偏乐观，建议 -r 3 以上")
+        print("\n  ! only 2 runs = 1 pair, the noise estimate is optimistic; use -r 3 or more")
     if contaminated:
-        print("\n  !! 基线里可能混进了一轮发散运行，阈值被抬高、将测不出真实回归：")
+        print("\n  !! one run may have diverged: thresholds are inflated "
+              "and real regressions will be missed")
         for c in contaminated:
             print(f"     - {c}")
-        print("     建议重新生成基线；若反复出现，说明该数据源上算法本身不稳定。")
+        print("     rebuild the baseline; if it keeps happening the algorithm "
+              "is unstable on this dataset.")
     return EXIT_PASS
 
 
 def cmd_check(args):
     meta_path = os.path.join(args.dir, "meta.json")
     if not os.path.isfile(meta_path):
-        die(f"基线不存在: {meta_path}")
+        die(f"no such baseline: {meta_path}")
     with open(meta_path) as fh:
         meta = json.load(fh)
 
@@ -208,68 +234,84 @@ def cmd_check(args):
     cand = load_traj(args.traj)
     metrics, n_common = compare(base, cand)
 
-    print(f"\n基线  {meta['name']}   ({meta['runs']} 轮 {meta['rate']}x, {meta['created'][:10]})")
+    print(f"\nBaseline  {meta['name']}   "
+          f"({meta['runs']} runs @ {meta['rate']}x, {meta['created'][:10]})")
     if meta.get("host") and args.host and meta["host"] != args.host:
-        print(f"  ! 基线生成于 {meta['host']}，当前 {args.host}；CPU 核数不同会改变 OpenMP 划分，建议重建基线")
+        print(f"  ! baseline was built on {meta['host']}, now on {args.host}; "
+              f"a different core count changes the OpenMP split, rebuild it")
     # 配置文件"内容"变了正是要检测的对象；但"文件名"都不同就是拿两套配置在比，无意义
     for field, got in (("cfg", args.cfg), ("cam_cfg", args.cam_cfg)):
         if got and meta.get(field) and meta[field] != got:
-            die(f"配置不一致：基线用 {meta[field]}，当前用 {got}。"
-                f"换配置文件请另建一套基线。")
+            die(f"config mismatch: baseline uses {meta[field]}, this run uses {got}. "
+                f"Build a separate baseline for a different config file.")
 
     # bag 身份
     if args.bag_size is not None and args.bag_size != meta["bag"]["size_bytes"]:
-        die(f"数据源不一致：基线 bag {meta['bag']['size_bytes']} 字节，当前 {args.bag_size} 字节")
+        die(f"dataset mismatch: baseline bag is {meta['bag']['size_bytes']} bytes, "
+            f"this one is {args.bag_size} bytes")
     if args.bag_topics and json.loads(args.bag_topics) != meta["bag"]["topics"]:
-        die("数据源不一致：话题消息数与基线不符")
+        die("dataset mismatch: per-topic message counts differ from the baseline")
 
     failures = []
 
-    print("\n硬指标")
-    hard = [
-        ("LiDAR 帧数", args.lidar_frames, meta["hard"]["lidar_frames"]),
-        ("有效图像帧数", args.valid_images, meta["hard"]["valid_images"]),
-        ("轨迹点数", args.traj_points, meta["hard"]["traj_points"]),
-    ]
-    for label, got, want in hard:
+    print("\nHard metrics")
+    rows = [["metric", "measured", "baseline", "", ""]]
+    for label, got, want in (
+        ("LiDAR frames", args.lidar_frames, meta["hard"]["lidar_frames"]),
+        ("Valid images", args.valid_images, meta["hard"]["valid_images"]),
+        ("Trajectory points", args.traj_points, meta["hard"]["traj_points"]),
+    ):
         ok = got == want
         if not ok:
-            failures.append(f"{label} {got} != 基线 {want}")
-        print(f"  {rpad(label, 18)}{lpad(str(got), 8)}  基线 {rpad(str(want), 8)}"
-              f"{'OK' if ok else 'FAIL'}")
+            failures.append(f"{label} {got} != baseline {want}")
+        rows.append([label, str(got), str(want), "OK" if ok else "FAIL", ""])
 
     ratio = n_common / meta["hard"]["traj_points"]
     ok = ratio >= 0.95
     if not ok:
-        failures.append(f"共同时间戳仅 {ratio:.1%}，更新调度已改变")
-    print(f"  {rpad('共同时间戳', 18)}{lpad(str(n_common), 8)}  "
-          f"基线 {rpad(str(meta['hard']['traj_points']), 8)}"
-          f"{'OK' if ok else 'FAIL'}  ({ratio:.1%})")
+        failures.append(f"only {ratio:.1%} of timestamps are shared, "
+                        f"the update schedule has changed")
+    rows.append(["Common timestamps", str(n_common), str(meta["hard"]["traj_points"]),
+                 "OK" if ok else "FAIL", f"({ratio:.1%})"])
+    print_table(rows, ["<", ">", ">", "<", "<"])
 
-    print(f"\n轨迹指标{lpad('实测', 12)}{lpad('阈值', 10)}{lpad('基线噪声', 12)}")
+    print("\nTrajectory metrics")
+    rows = [["metric", "measured", "threshold", "baseline noise", ""]]
     marginal = []
-    for key, label, unit, judged in METRICS:
-        got, limit = metrics[key], meta["threshold"][key]
+    stale = []
+    for key, label, _short, unit, judged in METRICS:
+        got = metrics[key]
+        # 新增的指标在老基线里没有阈值，只报测量值，重建基线后才纳入
+        if key not in meta["threshold"]:
+            stale.append(label_of(label, unit))
+            rows.append([label_of(label, unit), fmt(got), "-", "-", "(not in baseline)"])
+            continue
+        limit = meta["threshold"][key]
         if not judged:
-            verdict = "参考"
+            verdict = "(not judged)"
         elif got <= limit:
             verdict = "OK"
             if limit > 0 and got / limit >= NEAR_THRESHOLD:
-                marginal.append(f"{label} 已占阈值 {got / limit:.0%}")
+                marginal.append(f"{label_of(label, unit)} is at {got / limit:.0%} of threshold")
         else:
             verdict = "FAIL"
-            failures.append(f"{label} {fmt(got, unit)} > 阈值 {fmt(limit, unit)}")
-        print(f"  {rpad(label, 18)}{lpad(fmt(got, unit), 10)}{lpad(fmt(limit, unit), 10)}"
-              f"{lpad(fmt(meta['observed'][key], unit), 12)}   {verdict}")
+            failures.append(f"{label_of(label, unit)} {fmt(got)} > threshold {fmt(limit)}")
+        rows.append([label_of(label, unit), fmt(got), fmt(limit),
+                     fmt(meta["observed"][key]), verdict])
+    print_table(rows, ["<", ">", ">", ">", "<"])
+    if stale:
+        print(f"  ! this baseline predates {', '.join(stale)}; "
+              f"rebuild it to get the threshold for those")
 
     if failures:
         print("\n=> FAIL")
         for f in failures:
             print(f"   - {f}")
         return EXIT_FAIL
-    print("\n=> PASS   效果无变化（偏差落在噪声基线内）")
+    print("\n=> PASS   no change in behaviour (drift stays within the noise baseline)")
     if marginal:
-        print("   ! 余量不足，基线噪声可能估计偏低，建议 -r 5 重建基线：")
+        print("   ! little margin left, the baseline noise may be underestimated; "
+              "rebuild with -r 5")
         for m in marginal:
             print(f"     - {m}")
     return EXIT_PASS
@@ -277,23 +319,26 @@ def cmd_check(args):
 
 def cmd_list(args):
     if not os.path.isdir(args.root):
-        die(f"基线目录不存在: {args.root}")
+        die(f"no baseline directory: {args.root}")
     names = sorted(
         d for d in os.listdir(args.root)
         if os.path.isfile(os.path.join(args.root, d, "meta.json"))
     )
     if not names:
-        print(f"{args.root} 下没有基线。先跑: regress.sh baseline <bag>")
+        print(f"no baseline under {args.root}. Run: regress.sh baseline <bag>")
         return EXIT_PASS
-    print(f"{rpad('名字', 34)}{rpad('生成日期', 12)}{lpad('轮数', 6)}  bag")
+
+    # 阈值直接做成列，一行一套基线，长名字也不会把后面的列顶歪
+    judged = [(key, short, unit) for key, _label, short, unit, ok in METRICS if ok]
+    rows = [["name", "created", "runs", "rate"]
+            + [f"{short} [{unit}]" for _key, short, unit in judged] + ["bag"]]
     for name in names:
         with open(os.path.join(args.root, name, "meta.json")) as fh:
             meta = json.load(fh)
-        print(f"{rpad(name, 34)}{rpad(meta['created'][:10], 12)}{lpad(str(meta['runs']), 6)}  "
-              f"{os.path.basename(meta['bag']['path'])}")
-        thr = meta["threshold"]
-        print("      阈值  " + "  ".join(
-            f"{label} {fmt(thr[key], unit)}" for key, label, unit, judged in METRICS if judged))
+        rows.append([name, meta["created"][:10], str(meta["runs"]), f"{meta['rate']}x"]
+                    + [fmt(meta["threshold"][key]) for key, _short, _unit in judged]
+                    + [os.path.basename(meta["bag"]["path"])])
+    print_table(rows, ["<", "<", ">", ">"] + [">"] * len(judged) + ["<"], indent="")
     return EXIT_PASS
 
 
