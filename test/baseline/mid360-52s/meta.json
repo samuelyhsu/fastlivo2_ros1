@@ -1,0 +1,38 @@
+{
+  "name": "mid360-52s",
+  "created": "2026-07-26T12:22:52+08:00",
+  "bag": {
+    "path": "dataset/livo_2026-07-25-22-50-36.bag",
+    "size_bytes": 257450182,
+    "topics": {
+      "/left_camera/image/compressed": 519,
+      "/livox/imu": 10163,
+      "/livox/lidar": 508
+    }
+  },
+  "cfg": "mid360.yaml",
+  "cam_cfg": "camera_pinhole_mid360.yaml",
+  "commit": "5560045",
+  "submodule_commit": "d1c113b",
+  "host": "uplume",
+  "runs": 3,
+  "rate": 1.0,
+  "hard": {
+    "lidar_frames": 508,
+    "valid_images": 507,
+    "traj_points": 504
+  },
+  "safety_factor": 2.0,
+  "observed": {
+    "pos_rmse": 0.0426,
+    "final": 0.0477,
+    "max": 0.2416,
+    "max_rot_deg": 4.8114
+  },
+  "threshold": {
+    "pos_rmse": 0.0851,
+    "final": 0.0954,
+    "max": 0.4832,
+    "max_rot_deg": 9.6228
+  }
+}

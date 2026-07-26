@@ -4,3 +4,5 @@ devel/
 dataset/
 .venv/
 vcpkg_installed/
+test/.work/
+__pycache__/

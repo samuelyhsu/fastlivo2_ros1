@@ -1,0 +1,27 @@
+<launch>
+	<!-- 回归测试用建图节点。与 mapping_mid360.launch 的差别仅在于三项参数覆盖：
+	     evo/pose_output_en 打开（否则不写轨迹）、evo/seq_name 每轮唯一（否则互相覆盖）、
+	     pcd_save/pcd_save_en 关闭（interval:-1 会把整张图堆在内存里）。 -->
+
+	<arg name="seq" />
+	<arg name="cfg" default="mid360.yaml" />
+	<arg name="cam_cfg" default="camera_pinhole_mid360.yaml" />
+
+	<!-- 部分数据集直接录的是 raw 图像，不需要解压节点 -->
+	<arg name="republish" default="true" />
+	<arg name="img_topic" default="/left_camera/image" />
+
+	<rosparam command="load" file="$(find fast_livo)/config/$(arg cfg)" />
+
+	<param name="evo/pose_output_en" value="true" />
+	<param name="evo/seq_name" value="$(arg seq)" />
+	<param name="pcd_save/pcd_save_en" value="false" />
+
+	<node pkg="fast_livo" type="fastlivo_mapping" name="laserMapping" output="screen">
+		<rosparam file="$(find fast_livo)/config/$(arg cam_cfg)" />
+	</node>
+
+	<node if="$(arg republish)" pkg="image_transport" type="republish" name="republish"
+		args="compressed in:=$(arg img_topic) raw out:=$(arg img_topic)"
+		output="screen" respawn="true" />
+</launch>
