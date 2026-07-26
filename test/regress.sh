@@ -17,7 +17,17 @@
 #     regress.sh list                        # list existing baselines
 #     regress.sh baseline <bag> -n NAME -r 5 # baseline name and run count
 #     regress.sh check -n NAME --rate 1      # baseline name and replay rate
+#     regress.sh baseline <bag> --rate 5     # build the baseline at 5x too
 #     regress.sh baseline <bag> --cfg avia.yaml --cam-cfg camera_pinhole.yaml
+#
+#  --rate defaults to 1 for baseline and 5 for check. A sped-up baseline is
+#  much faster to build and, on the datasets tried so far, produces the same
+#  frames and the same trajectory; but it is the replay rate that decides which
+#  frames republish (queue depth 1) drops, so if a rate ever does drop frames
+#  the hard metrics stored in the baseline are the ones from that rate and a
+#  check at another rate will fail on them. Backlog is checked on every run, so
+#  a rate the algorithm cannot keep up with exits 3 instead of writing a
+#  worthless baseline.
 #
 #  One dataset, one baseline: every -n NAME is a directory baseline/NAME/ and
 #  its meta.json records the bag path and the config files. So check only needs
@@ -49,7 +59,11 @@ CFG_SET=false     # 命令行显式指定过 --cfg
 CAM_CFG_SET=false # 命令行显式指定过 --cam-cfg
 SAFETY=2.0
 RUNS=3
-RATE=5
+# 留空表示"命令行没给"，由各子命令填自己的默认值：baseline 求稳用 1x，
+# check 求快用 5x。共用一个常量默认值会让 baseline 悄悄变成 5x。
+RATE=""
+RATE_BASELINE_DEFAULT=1
+RATE_CHECK_DEFAULT=5
 NAME=""
 
 EXIT_FAIL=1
@@ -340,6 +354,7 @@ cmd_baseline() {
   [[ -n "$bag" ]] || err "usage: $(basename "$SELF") baseline <bag> [-n NAME] [-r RUNS]"
   shift
   parse_flags "$@"
+  RATE="${RATE:-$RATE_BASELINE_DEFAULT}"
   [[ -f "$bag" ]] || err "no such bag: $bag"
   bag="$(readlink -f "$bag")"
   [[ -n "$NAME" ]] || NAME="$(basename "$bag" .bag)"
@@ -348,19 +363,21 @@ cmd_baseline() {
   t_stage=$(now)
   ensure_roscore
   mark "roscore" "$t_stage"
-  log "baseline '$NAME': $RUNS runs at 1x on $(basename "$bag")"
+  log "baseline '$NAME': $RUNS runs at ${RATE}x on $(basename "$bag")"
 
   local trajs=() i
   local lidar="" images="" points=""
   for i in $(seq 1 "$RUNS"); do
     log "--- run $i/$RUNS ---"
-    run_once 1 "base$i" "$bag"
+    run_once "$RATE" "base$i" "$bag"
+    # 积压跑出来的基线是废的：阈值由丢帧噪声主导，之后再也测不出回归
+    backlog_check
     trajs+=("$R_TRAJ")
     if [[ -z "$lidar" ]]; then
       lidar="$R_LIDAR" images="$R_IMAGES" points="$R_POINTS"
     elif [[ "$lidar" != "$R_LIDAR" || "$images" != "$R_IMAGES" || "$points" != "$R_POINTS" ]]; then
       err "run $i disagrees with the earlier runs (LiDAR $R_LIDAR/$lidar frames, images $R_IMAGES/$images, trajectory $R_POINTS/$points points) --
-    the machine itself is unstable, so the baseline would be worthless. Check for other processes eating CPU, or re-run at 1x."
+    the machine itself is unstable, so the baseline would be worthless. Check for other processes eating CPU, or re-run with --rate 1."
     fi
   done
 
@@ -375,7 +392,7 @@ cmd_baseline() {
     --cfg "$CFG" --cam-cfg "$CAM_CFG" \
     --commit "$(git -C "$WS" rev-parse --short HEAD 2>/dev/null || echo '')" \
     --submodule-commit "$(git -C "$WS/src/FAST-LIVO2" rev-parse --short HEAD 2>/dev/null || echo '')" \
-    --host "$(hostname)" --rate 1 \
+    --host "$(hostname)" --rate "$RATE" \
     --lidar-frames "$lidar" --valid-images "$images" --traj-points "$points"
   mark "bag scan + compare" "$t_stage"
 
@@ -384,6 +401,7 @@ cmd_baseline() {
 
 cmd_check() {
   parse_flags "$@"
+  RATE="${RATE:-$RATE_CHECK_DEFAULT}"
   local dir
   dir="$(resolve_baseline)"
   [[ -f "$dir/meta.json" ]] || err "no such baseline: $dir"
